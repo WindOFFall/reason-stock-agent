@@ -1,10 +1,6 @@
-from pgvector.sqlalchemy import Vector
-
-from database import get_db_client
 from crawler import TWStockCrawler, USStockCrawler, AnueCrawler,  GoogleNewsCrawler, PTTCrawler
 
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ==========================================
 # 🛠️ 歷史回補專用腳本
@@ -38,19 +34,19 @@ def backfill_job():
         # 鉅亨網：補 1 年
         print("   📰 [3/5] 鉅亨網回補 (過去 365 天)...")
         AnueCrawler().run_safe(days_back=365, mode="backfill")
-    except Exception as e: print(e)
+    except Exception as e: print(f"   ❌ 鉅亨網錯誤: {e}")
 
     try:
         # Google News：補 1 年
         print("   🔍 [4/5] Google News 回補 (過去 365 天)...")
         GoogleNewsCrawler().run_safe(keyword="台股", days_back=365, mode="backfill")
-    except Exception as e: print(e)
+    except Exception as e: print(f"   ❌ Google News 錯誤: {e}")
 
     try:
         # PTT：PTT 比較慢且容易斷，建議先補 60 天就好，穩定後再改 365
         print("   💬 [5/5] PTT Stock 回補 (過去 60 天)...")
         PTTCrawler().run_safe(days_back=60, mode="backfill")
-    except Exception as e: print(e)
+    except Exception as e: print(f"   ❌ PTT 錯誤: {e}")
     
     print(f"\n✅ [歷史回補結束] 所有任務已完成！")
 
