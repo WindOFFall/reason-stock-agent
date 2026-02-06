@@ -16,6 +16,7 @@
 
 - `main.py`: **AI Agent 主程式**。這是整個專案的入口，負責協調資料收集與後續的 AI 分析流程。
 - `data_collector.py`: **資料收集模組**。封裝了所有爬蟲邏輯，供主程式呼叫，負責將市場數據準備好。
+- `stock_analysis.ipynb`: **資料分析 Notebook**。使用 Jupyter Lab 開啟，可直接從資料庫讀取數據並轉為 DataFrame 進行視覺化分析。
 - `crawler/`: (推測) 包含各個數據源的具體爬蟲實作類別。
 
 ## 🛠️ 如何使用
@@ -38,6 +39,14 @@ python main.py
 3.  鉅亨網新聞回補
 4.  Google News 回補
 5.  PTT Stock 版回補
+
+### 3. 進行資料分析
+
+若要手動分析資料庫中的數據，請啟動 Jupyter Lab：
+
+```bash
+jupyter lab stock_analysis.ipynb
+```
 
 ## ⚠️ 注意事項
 
