@@ -52,8 +52,12 @@ class TWStockCrawler(BaseCrawler):
 
     def _get_twse_daily(self, date_str):
         url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALL"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Referer": "https://www.twse.com.tw/"
+        }
         try:
-            res = requests.get(url, timeout=30)
+            res = requests.get(url, headers=headers, timeout=30)
             if res.status_code != 200: return pd.DataFrame()
             json_data = res.json()
             if json_data.get('stat') != 'OK': return pd.DataFrame()
@@ -66,35 +70,60 @@ class TWStockCrawler(BaseCrawler):
             df = pd.DataFrame(raw_data, columns=fields)
             if '證券代號' in df.columns: df = df[df['證券代號'].apply(self._is_clean_stock)]
             return df
-        except: return pd.DataFrame()
+        except Exception as e:
+            print(f"      [TWSE 錯誤] 解析失敗: {e}")
+            return pd.DataFrame()
 
     def _get_tpex_daily(self, date_str):
-        try:
-            roc_year = int(date_str[:4]) - 1911
-            roc_date = f"{roc_year}/{date_str[4:6]}/{date_str[6:8]}"
-            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={roc_date}&o=json"
-            res = requests.get(url, timeout=30)
-            if res.status_code != 200: return pd.DataFrame()
-            json_data = res.json()
-            raw_data, fields = [], []
-            if 'tables' in json_data:
-                 for table in json_data['tables']:
-                    if '上櫃股票行情' in table.get('title', ''):
-                        raw_data = table.get('data', []); fields = table.get('fields', []); break
-            elif 'aaData' in json_data: raw_data = json_data.get('aaData', [])
-            if not raw_data: return pd.DataFrame()
-            if fields: df = pd.DataFrame(raw_data, columns=fields)
-            else:
-                df = pd.DataFrame(raw_data)
-                if df.shape[1] >= 15: df.columns = ["證券代號", "證券名稱", "收盤", "漲跌", "開盤", "最高", "最低", "均價", "成交股數", "成交金額", "成交筆數"] + list(df.columns[11:])
-            rename_map = {'代號': '證券代號', '名稱': '證券名稱', '收盤': '收盤價', '開盤': '開盤價', '最高': '最高價', '最低': '最低價'}
-            df.rename(columns=rename_map, inplace=True)
-            if '證券代號' in df.columns: df = df[df['證券代號'].apply(self._is_clean_stock)]
-            return df
-        except: return pd.DataFrame()
+        roc_year = int(date_str[:4]) - 1911
+        roc_date = f"{roc_year}/{date_str[4:6]}/{date_str[6:8]}"
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={roc_date}&o=json"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Referer": "https://www.tpex.org.tw/"
+        }
+        
+        # 加入 3 次重試機制，對抗櫃買中心的阻擋
+        for attempt in range(3):
+            try:
+                res = requests.get(url, headers=headers, timeout=30)
+                if res.status_code != 200:
+                    print(f"      [TPEx 警告] HTTP {res.status_code}，等待 5 秒重試...")
+                    time.sleep(5)
+                    continue
+                    
+                json_data = res.json()
+                raw_data, fields = [], []
+                if 'tables' in json_data:
+                     for table in json_data['tables']:
+                        if '上櫃股票行情' in table.get('title', ''):
+                            raw_data = table.get('data', []); fields = table.get('fields', []); break
+                elif 'aaData' in json_data: raw_data = json_data.get('aaData', [])
+                
+                if not raw_data: return pd.DataFrame()
+                
+                if fields: df = pd.DataFrame(raw_data, columns=fields)
+                else:
+                    df = pd.DataFrame(raw_data)
+                    if df.shape[1] >= 15: df.columns = ["證券代號", "證券名稱", "收盤", "漲跌", "開盤", "最高", "最低", "均價", "成交股數", "成交金額", "成交筆數"] + list(df.columns[11:])
+                rename_map = {'代號': '證券代號', '名稱': '證券名稱', '收盤': '收盤價', '開盤': '開盤價', '最高': '最高價', '最低': '最低價'}
+                df.rename(columns=rename_map, inplace=True)
+                if '證券代號' in df.columns: df = df[df['證券代號'].apply(self._is_clean_stock)]
+                return df
+                
+            except ValueError:
+                print(f"      [TPEx 警告] 收到非 JSON 格式 (可能被防火牆阻擋)，等待 5 秒重試...")
+                time.sleep(5)
+            except Exception as e:
+                print(f"      [TPEx 錯誤] 解析失敗: {e}，等待 5 秒重試...")
+                time.sleep(5)
+                
+        print("      ❌ [TPEx] 重試 3 次皆失敗，放棄該日上櫃資料。")
+        return pd.DataFrame()
 
-    def run(self, mode="daily", days_back=5):
-        if mode == "backfill": days_back = 365
+    def run(self, mode="daily", days_back=None):
+        if days_back is None:
+            days_back = 365 if mode == "backfill" else 5
         stop_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         start_date = datetime.now() - timedelta(days=1)
         target_date = start_date
@@ -129,16 +158,19 @@ class TWStockCrawler(BaseCrawler):
                     if not df_tpex.empty: df_tpex['market'] = 'TPEx'; frames.append(df_tpex)
                     
                     log_status = 'EMPTY'
-                    if frames:
+                    if not df_twse.empty and not df_tpex.empty:
+                        # 兩者都有，才進行合併與正常寫入
                         final_df = pd.concat(frames, ignore_index=True)
                         final_df['date'] = date_iso
-                        if df_twse.empty and not df_tpex.empty: print(f"   ⚠️ 異常：僅有上櫃資料，跳過。")
-                        else:
-                            final_df = self._clean_data(final_df)
-                            final_df.drop_duplicates(subset=['date', 'stock_id'], keep='last', inplace=True)
-                            count = db.upsert_from_df(table="tw_daily_prices", df=final_df, on=["date", "stock_id"])
-                            print(f"   ✅ 寫入: {count} 筆")
-                            log_status = 'DONE'
+                        final_df = self._clean_data(final_df)
+                        final_df.drop_duplicates(subset=['date', 'stock_id'], keep='last', inplace=True)
+                        count = db.upsert_from_df(table="tw_daily_prices", df=final_df, on=["date", "stock_id"])
+                        print(f"   ✅ 寫入: {count} 筆")
+                        log_status = 'DONE'
+                    elif not df_twse.empty and df_tpex.empty:
+                        print(f"   ⚠️ 警告：缺少上櫃資料 (API可能尚未更新)，視為未完成，放棄寫入等待重試。")
+                    elif df_twse.empty and not df_tpex.empty:
+                        print(f"   ⚠️ 異常：僅有上櫃資料，視為未完成，放棄寫入等待重試。")
                     else: print(f"   💤 休市")
 
                     log_df = pd.DataFrame([{ "date": date_iso, "status": log_status }])
@@ -191,7 +223,7 @@ class USStockCrawler(BaseCrawler):
         df['date'] = pd.to_datetime(df['date']).dt.date
         return df
 
-    def run(self, mode="daily", years_back=1):
+    def run(self, mode="daily", days_back=365):
         print(f"🚀 [美股] 模式: {mode}...")
         with get_db_client() as db:
             self._init_tables(db)
@@ -204,8 +236,8 @@ class USStockCrawler(BaseCrawler):
                     if last_date: start_date = last_date + timedelta(days=1)
                     else: start_date = datetime.now().date() - timedelta(days=30)
                 else:
-                    print(f"   [回補] 強制重抓 {ticker} 過去 {years_back} 年...")
-                    start_date = datetime.now().date() - timedelta(days=365*years_back)
+                    print(f"   [回補] 強制重抓 {ticker} 過去 {days_back} 天...")
+                    start_date = datetime.now().date() - timedelta(days=days_back)
 
                 if start_date > datetime.now().date():
                     continue

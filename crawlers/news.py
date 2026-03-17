@@ -164,7 +164,7 @@ class PTTCrawler(NewsBase):
         
         if current_end is None: return 
         
-        print(f"   [PTT] 啟動智慧補漏，目標推至: {limit_dt.date()}")
+        print(f"   [PTT] 啟動智慧補漏，目標區間: {limit_dt.date()} ~ {current_end.date()}")
         
         url = "https://www.ptt.cc/bbs/Stock/index.html"
         cookies = {"over18": "1"}
@@ -173,8 +173,19 @@ class PTTCrawler(NewsBase):
         
         while pages_crawled < max_pages:
             try:
-                res = requests.get(url, headers=COMMON_HEADERS, cookies=cookies, timeout=10)
-                if res.status_code != 200: break
+                # 加入簡單的連線重試機制，防止 PTT 偶發的 10054 斷線
+                res = None
+                for attempt in range(3):
+                    try:
+                        res = requests.get(url, headers=COMMON_HEADERS, cookies=cookies, timeout=10)
+                        if res.status_code == 200: break
+                    except Exception as req_e:
+                        time.sleep(2) # 斷線等 2 秒再試
+                        
+                if res is None or res.status_code != 200: 
+                    print("      ⚠️ PTT 連線多次失敗，提早結束翻頁。")
+                    break
+                    
                 soup = BeautifulSoup(res.text, "html.parser")
                 articles = soup.select("div.r-ent")
                 news_list = []
@@ -196,7 +207,9 @@ class PTTCrawler(NewsBase):
                         min_date_in_page = min(min_date_in_page, pub_date)
                     except: pub_date = datetime.now()
                     
-                    if pub_date >= limit_dt:
+                    # 🔥 關鍵修正：確保只抓取我們需要的「缺口時間」的資料
+                    # 避免已經存在資料庫的資料又被抓出來 Upsert，造成一直重複新增的錯覺
+                    if limit_dt <= pub_date <= current_end:
                         link = "https://www.ptt.cc" + title_div['href']
                         news_list.append({
                             "url_hash": hashlib.sha256(link.encode()).hexdigest(),
@@ -213,7 +226,7 @@ class PTTCrawler(NewsBase):
                 if prev and "上頁" in prev.text:
                     url = "https://www.ptt.cc" + prev["href"]
                     pages_crawled += 1
-                    if pages_crawled % 10 == 0: print(f"      🔄 已翻 {pages_crawled} 頁...")
+                    if pages_crawled % 10 == 0: print(f"      🔄 已翻 {pages_crawled} 頁 (路過已有資料，尋找缺口中)...")
                     time.sleep(random.uniform(1.5, 3))
                 else: break
             except Exception as e: 
