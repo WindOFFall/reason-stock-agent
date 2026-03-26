@@ -10,6 +10,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import text
+import json
 
 from database import get_db_client # 引入統一的資料庫工具
 
@@ -32,12 +33,37 @@ client = genai.Client(api_key=api_key)
 # ════════════════════════════════════════════════════
 # 靜態設定與關鍵字
 # ════════════════════════════════════════════════════
-STOCK_NAME_MAP = {
-    "2330": "台積電", "2317": "鴻海", "2382": "廣達",
-    "3711": "日月光", "2454": "聯發科", "6669": "緯穎",
-    "2308": "台達電", "3231": "緯創", "2379": "瑞昱",
-}
+def load_stock_mapping():
+    """動態讀取股票代號與名稱的對應表"""
+    mapping_file = "stock_mapping.json"
+    if os.path.exists(mapping_file):
+        with open(mapping_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        # 如果沒有檔案，使用預設值並自動建立 JSON 檔
+        default_map = {
+            # 晶圓代工與封測
+            "2330": "台積電", "2303": "聯電", "3711": "日月光", "2449": "京元電子",
+            # IC 設計與 IP
+            "2454": "聯發科", "2379": "瑞昱", "3034": "聯詠", "3443": "創意",
+            # AI 伺服器與代工
+            "2317": "鴻海", "2382": "廣達", "3231": "緯創", "6669": "緯穎", "2356": "英業達", "2376": "技嘉",
+            # 電源與散熱
+            "2308": "台達電", "3017": "奇鋐", "3324": "雙鴻", "2421": "建準",
+            # 網通與光通訊
+            "2345": "智邦", "3163": "波若威", "4979": "華星光",
+            # 記憶體
+            "2344": "華邦電", "2337": "旺宏", "8299": "群聯",
+            # 零組件與 PCB
+            "2368": "金像電", "3037": "欣興", "2313": "華通",
+            # PC/NB 品牌廠
+            "2357": "華碩", "2353": "宏碁", "2395": "研華",
+        }
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(default_map, f, ensure_ascii=False, indent=4)
+        return default_map
 
+STOCK_NAME_MAP = load_stock_mapping()
 # 反查：公司名稱 → 代號
 NAME_TO_ID = {v: k for k, v in STOCK_NAME_MAP.items()}
 
