@@ -166,6 +166,118 @@ def send_telegram_report(caption: str, document_text: str, filename: str = "repo
     log("  ❌ Telegram 推播失敗，已重試 3 次")
 
 # ════════════════════════════════════════════════════════════════
+# 📊  月營收趨勢
+# ════════════════════════════════════════════════════════════════
+
+def get_revenue_trend(conn, stock_id: str) -> dict:
+    """
+    查詢月營收趨勢，回傳：
+      yoy_latest  : 最新月年增率(%)
+      yoy_prev    : 上個月年增率(%)
+      trend       : 'turning_positive' / 'positive' / 'negative' / None
+      summary     : 給 LLM 看的文字描述
+    資料不存在時回傳空 dict。
+    """
+    try:
+        df = pd.read_sql(text("""
+            SELECT date, revenue
+            FROM tw_monthly_revenue
+            WHERE stock_id = :sid
+            ORDER BY date
+        """), conn.engine, params={"sid": stock_id})
+
+        if len(df) < 13:   # 需要至少 13 個月才能算年增率
+            return {}
+
+        df["yoy"] = df["revenue"].pct_change(12) * 100
+        df = df.dropna(subset=["yoy"])
+
+        if len(df) < 2:
+            return {}
+
+        yoy_latest = round(float(df["yoy"].iloc[-1]), 1)
+        yoy_prev   = round(float(df["yoy"].iloc[-2]), 1)
+
+        if yoy_prev < 0 and yoy_latest >= 5:   # 由負轉正且年增率 ≥ 5%，避免雜訊
+            trend   = "turning_positive"
+            summary = f"月營收年增率由負轉正（{yoy_prev:+.1f}% → {yoy_latest:+.1f}%），反轉訊號"
+        elif yoy_latest >= 5:
+            trend   = "positive"
+            summary = f"月營收年增率正成長（{yoy_latest:+.1f}%）"
+        else:
+            trend   = "negative"
+            summary = f"月營收年增率衰退（{yoy_latest:+.1f}%）"
+
+        return {
+            "yoy_latest": yoy_latest,
+            "yoy_prev":   yoy_prev,
+            "trend":      trend,
+            "summary":    summary,
+        }
+    except Exception:
+        return {}
+
+
+# ════════════════════════════════════════════════════════════════
+# 📊  EPS 趨勢
+# ════════════════════════════════════════════════════════════════
+
+def get_eps_trend(conn, stock_id: str) -> dict:
+    """
+    查詢季度 EPS 趨勢，回傳：
+      yoy_latest   : 最新季年增率(%)
+      yoy_prev     : 上一季年增率(%)
+      eps_latest   : 最新季 EPS 值
+      trend        : 'turning_positive' / 'positive' / 'negative' / None
+      summary      : 給 LLM 看的文字描述
+    資料不存在時回傳空 dict。
+    """
+    try:
+        df = pd.read_sql(text("""
+            SELECT date, value AS eps
+            FROM tw_financial_statements
+            WHERE stock_id = :sid AND type = 'EPS'
+            ORDER BY date
+        """), conn.engine, params={"sid": stock_id})
+
+        if len(df) < 5:   # 至少 5 季才能算年增率
+            return {}
+
+        df["yoy"] = df["eps"].pct_change(4) * 100   # 季報對比去年同季
+        df = df.dropna(subset=["yoy"])
+
+        if len(df) < 2:
+            return {}
+
+        yoy_latest  = round(float(df["yoy"].iloc[-1]), 1)
+        yoy_prev    = round(float(df["yoy"].iloc[-2]), 1)
+        eps_latest  = round(float(df["eps"].iloc[-1]), 2)
+
+        if yoy_prev < 0 and yoy_latest >= 10:
+            trend   = "turning_positive"
+            summary = f"EPS 年增率由負轉正（{yoy_prev:+.1f}% → {yoy_latest:+.1f}%），獲利反轉"
+        elif yoy_latest >= 20:
+            trend   = "positive"
+            summary = f"EPS 年增率強勁成長（{yoy_latest:+.1f}%），EPS={eps_latest}"
+        elif yoy_latest >= 5:
+            trend   = "positive"
+            summary = f"EPS 年增率正成長（{yoy_latest:+.1f}%），EPS={eps_latest}"
+        else:
+            trend   = "negative"
+            summary = f"EPS 年增率衰退（{yoy_latest:+.1f}%），EPS={eps_latest}"
+
+        return {
+            "yoy_latest":  yoy_latest,
+            "yoy_prev":    yoy_prev,
+            "eps_latest":  eps_latest,
+            "trend":       trend,
+            "summary":     summary,
+        }
+    except Exception:
+        return {}
+
+
+# ════════════════════════════════════════════════════════════════
 # 📊  技術指標計算
 # ════════════════════════════════════════════════════════════════
 
@@ -253,12 +365,35 @@ def screen_institutional(conn) -> tuple:
             WHERE date >= CURRENT_DATE - INTERVAL '30 days'
             GROUP BY stock_id
             HAVING COUNT(*) >= 15
+        ),
+        price_5d AS (
+            SELECT DISTINCT ON (stock_id) stock_id, close AS close_5d
+            FROM tw_daily_prices
+            WHERE date <= CURRENT_DATE - INTERVAL '5 days'
+            ORDER BY stock_id, date DESC
+        ),
+        consec_foreign AS (
+            SELECT stock_id, COUNT(*) AS consec_days
+            FROM (
+                SELECT stock_id, date,
+                       foreign_investor > 0 AS is_buy,
+                       SUM(CASE WHEN foreign_investor <= 0 THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY stock_id ORDER BY date DESC) AS break_count
+                FROM tw_institutional_trades
+                WHERE date >= CURRENT_DATE - INTERVAL '30 days'
+            ) sub
+            WHERE break_count = 0 AND is_buy = true
+            GROUP BY stock_id
         )
         SELECT t.stock_id, t.total, t.foreign_investor, t.investment_trust,
-               p.last_close, v.avg_volume, v.ma20_liquidity
+               p.last_close, v.avg_volume, v.ma20_liquidity,
+               ROUND(((p.last_close - p5.close_5d) / NULLIF(p5.close_5d, 0) * 100)::numeric, 1) AS change_5d_pct,
+               COALESCE(cf.consec_days, 1) AS consec_foreign_days
         FROM tw_institutional_trades t
-        JOIN latest_price p ON p.stock_id = t.stock_id
-        JOIN avg_vol      v ON v.stock_id = t.stock_id
+        JOIN latest_price p   ON p.stock_id  = t.stock_id
+        JOIN avg_vol      v   ON v.stock_id  = t.stock_id
+        LEFT JOIN price_5d p5 ON p5.stock_id = t.stock_id
+        LEFT JOIN consec_foreign cf ON cf.stock_id = t.stock_id
         WHERE t.date = (SELECT MAX(date) FROM tw_institutional_trades)
           AND v.avg_volume > 0
     """
@@ -313,21 +448,33 @@ def screen_institutional(conn) -> tuple:
     def build_candidates(rows, label, inst_col_idx):
         """inst_col_idx: 2=foreign_investor, 3=investment_trust"""
         result = []
-        for stock_id, _, foreign, trust, last_close, avg_volume, ma20_liq in rows:
-            inst_vol = foreign if inst_col_idx == 2 else trust
-            ind      = calc_indicators(conn, stock_id) or {}
-            name     = STOCK_NAME_MAP.get(stock_id, stock_id)
-            adv_pct  = inst_vol / avg_volume * 100 if avg_volume else 0
-            amt_m    = inst_vol * last_close / 1_000_000
-            detail_extra = f"ADV {adv_pct:.1f}%，金額 {amt_m:.0f}百萬元"
+        for stock_id, _, foreign, trust, last_close, avg_volume, ma20_liq, change_5d, consec_days in rows:
+            inst_vol   = foreign if inst_col_idx == 2 else trust
+            ind        = calc_indicators(conn, stock_id) or {}
+            name       = STOCK_NAME_MAP.get(stock_id, stock_id)
+            adv_pct    = inst_vol / avg_volume * 100 if avg_volume else 0
+            amt_m      = inst_vol * last_close / 1_000_000
+            consec_days = int(consec_days) if consec_days else 1
+            detail_extra = f"ADV {adv_pct:.1f}%，金額 {amt_m:.0f}百萬元，連續買超{consec_days}天"
+
+            # 近 5 日動能分群
+            chg = float(change_5d) if change_5d is not None else 0.0
+            if chg < 5:
+                momentum_tag = "早期布局"
+            elif chg < 15:
+                momentum_tag = "強勢噴發"
+            else:
+                momentum_tag = "超漲警戒"
 
             if not ind:
                 result.append({
                     "stock_id": stock_id, "name": name, "source": f"法人買超({label})",
                     "score": 1, "detail": f"{detail_extra}，無技術指標",
                     "indicators": {},
+                    "momentum_tag": momentum_tag, "change_5d": chg,
+                    "consec_foreign_days": consec_days,
                 })
-                log(f"  ⚠️ [{label}] {stock_id} {name}：{detail_extra}，無技術指標（score=1）")
+                log(f"  ⚠️ [{label}] {stock_id} {name}：{detail_extra}，無技術指標（score=1）[{momentum_tag} {chg:+.1f}%]")
                 continue
 
             above_ma20 = ind.get("above_ma20", False)
@@ -343,6 +490,18 @@ def screen_institutional(conn) -> tuple:
             else:
                 score, reason, emoji = 1, f"跌破月線，量比偏低（{vol_ratio:.1f}x）", "⚪"
 
+            # 連續買超 3 天以上加分
+            if consec_days >= 3:
+                score += 1
+
+            # 超漲警戒扣分
+            if momentum_tag == "超漲警戒":
+                score -= 1
+
+            # 月營收 / EPS：只取資訊給 LLM，不加入評分
+            rev = get_revenue_trend(conn, stock_id)
+            eps = get_eps_trend(conn, stock_id)
+
             size_tag = "大型" if (ma20_liq or 0) >= LARGE_LIQUIDITY else "中小"
             result.append({
                 "stock_id": stock_id, "name": name, "source": f"法人買超({label})",
@@ -350,8 +509,13 @@ def screen_institutional(conn) -> tuple:
                 "indicators": ind,
                 "size_tag": size_tag,
                 "ma20_liquidity": ma20_liq,
+                "momentum_tag": momentum_tag, "change_5d": chg,
+                "consec_foreign_days": consec_days,
+                "revenue_trend": rev,
+                "eps_trend": eps,
             })
-            log(f"  {emoji} [{label}] {stock_id} {name}：{detail_extra}，量比 {vol_ratio:.1f}x，{reason}")
+            rev_str = f"  營收:{rev['yoy_latest']:+.1f}%({'↑轉正' if rev.get('trend')=='turning_positive' else '↑' if rev.get('trend')=='positive' else '↓'})" if rev.get("yoy_latest") is not None else "  營收:無資料"
+            log(f"  {emoji} [{label}] {stock_id} {name}：{detail_extra}，量比 {vol_ratio:.1f}x，{reason}  [{momentum_tag} {chg:+.1f}%]{rev_str}")
         return result
 
     # A3：外資賣超觀察（純觀察，不進入候選池）
@@ -881,11 +1045,22 @@ def llm_buy_decision(candidate: dict, conference_signals: dict,
     """AI 買進決策"""
     ind = candidate.get("indicators", {})
 
+    momentum_tag = candidate.get("momentum_tag", "")
+    change_5d    = candidate.get("change_5d") or 0
+    momentum_hint = ""
+    if momentum_tag == "早期布局":
+        momentum_hint = f"（近5日漲幅 {change_5d:+.1f}%，法人剛開始建倉，入場時機較佳）"
+    elif momentum_tag == "強勢噴發":
+        momentum_hint = f"（近5日漲幅 {change_5d:+.1f}%，趨勢已啟動，屬追勢型操作）"
+    elif momentum_tag == "超漲警戒":
+        momentum_hint = f"（近5日漲幅 {change_5d:+.1f}%，短線過熱，注意法人是否藉買超製造流動性出貨）"
+
     tech_summary = (
         f"股價 {ind.get('close', 'N/A')}，"
         f"{'站上' if ind.get('above_ma20') else '跌破'}月線，"
         f"量比 {ind.get('vol_ratio', 0):.1f}x，"
         f"RSI {ind.get('rsi', 0):.1f}"
+        + (f"，動能階段：{momentum_tag}{momentum_hint}" if momentum_tag else "")
     )
 
     conf_summary = "\n".join(conference_signals.get("guidance", [])[:3]) or "無法說會資料"
@@ -900,14 +1075,18 @@ def llm_buy_decision(candidate: dict, conference_signals: dict,
     macro_combined = "\n".join(filter(None, [market_env_str, macro_summary]))
     macro_section  = f"\n【今日宏觀背景】\n{macro_combined}" if macro_combined else ""
 
-    profile_section = f"\n【公司簡介】\n{company_profile}" if company_profile else ""
+    profile_section  = f"\n【公司簡介】\n{company_profile}" if company_profile else ""
+    rev_trend        = candidate.get("revenue_trend", {})
+    revenue_section  = f"\n【月營收趨勢】\n{rev_trend['summary']}" if rev_trend.get("summary") else ""
+    eps_trend_data   = candidate.get("eps_trend", {})
+    eps_section      = f"\n【EPS趨勢】\n{eps_trend_data['summary']}" if eps_trend_data.get("summary") else ""
 
     prompt = f"""
 你是台股短線交易員，根據以下資料對這支股票做出明確的進場決策。
 
 股票：{candidate['name']}（{candidate['stock_id']}）
 篩選來源：{', '.join(candidate.get('sources', []))}
-{event_hint}{profile_section}{macro_section}
+{event_hint}{profile_section}{revenue_section}{eps_section}{macro_section}
 
 【技術面】
 {tech_summary}
@@ -1570,15 +1749,31 @@ def run_daily_agent():
         risk      = d.get("risk",   "").replace("<", "〈").replace(">", "〉")
         src       = "＋".join(c.get("sources", []))
 
-        profile  = c.get("profile", "")
-        size_tag = c.get("size_tag", "")
-        ma20_liq = c.get("ma20_liquidity") or 0
-        liq_str  = f"  日均成交{ma20_liq/1_000_000:.0f}百萬" if ma20_liq else ""
+        profile      = c.get("profile", "")
+        size_tag     = c.get("size_tag", "")
+        ma20_liq     = c.get("ma20_liquidity") or 0
+        liq_str      = f"  日均成交{ma20_liq/1_000_000:.0f}百萬" if ma20_liq else ""
+        momentum_tag = c.get("momentum_tag", "")
+        change_5d    = c.get("change_5d") or 0
+        MOMENTUM_EMOJI = {"早期布局": "🌱", "強勢噴發": "🚀", "超漲警戒": "⚠️"}
         msg += f"{emoji} <b>{c['stock_id']} {c['name']}</b>  {action}／{conf}\n"
         if profile:
             msg += f"   🏢 {profile}\n"
         if size_tag:
             msg += f"   📊 規模：{size_tag}股{liq_str}\n"
+        consec_days  = c.get("consec_foreign_days", 0)
+        rev_trend    = c.get("revenue_trend", {})
+        if momentum_tag:
+            m_emoji = MOMENTUM_EMOJI.get(momentum_tag, "")
+            consec_str = f"  外資連續買超{consec_days}天" if consec_days >= 2 else ""
+            msg += f"   {m_emoji} 動能：{momentum_tag}（近5日 {change_5d:+.1f}%）{consec_str}\n"
+        if rev_trend.get("summary"):
+            rev_emoji = "📈" if rev_trend.get("trend") == "turning_positive" else ("✅" if rev_trend.get("trend") == "positive" else "📉")
+            msg += f"   {rev_emoji} 營收：{rev_trend['summary']}\n"
+        eps_trend = c.get("eps_trend", {})
+        if eps_trend.get("summary"):
+            eps_emoji = "📈" if eps_trend.get("trend") == "turning_positive" else ("✅" if eps_trend.get("trend") == "positive" else "📉")
+            msg += f"   {eps_emoji} EPS：{eps_trend['summary']}\n"
         msg += f"   {src}  |  {ma_str}  量比{vol_r:.1f}x  RSI{rsi:.0f}\n"
         msg += f"   📌 {reason}\n"
         msg += f"   ⚠️ {risk}\n"
