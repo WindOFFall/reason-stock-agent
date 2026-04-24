@@ -233,8 +233,11 @@ class USStockCrawler(BaseCrawler):
             for ticker in self.target_tickers:
                 if mode == "daily":
                     last_date = last_update_map.get(ticker)
-                    if last_date: start_date = last_date + timedelta(days=1)
-                    else: start_date = datetime.now().date() - timedelta(days=30)
+                    if last_date:
+                        # 往前一天重抓，確保前次收盤不完整的資料被補回
+                        start_date = last_date
+                    else:
+                        start_date = datetime.now().date() - timedelta(days=30)
                 else:
                     print(f"   [回補] 強制重抓 {ticker} 過去 {days_back} 天...")
                     start_date = datetime.now().date() - timedelta(days=days_back)

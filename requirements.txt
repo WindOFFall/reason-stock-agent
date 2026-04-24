@@ -1,0 +1,30 @@
+# Web / HTTP
+requests
+feedparser
+beautifulsoup4
+httpx==0.28.1
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Data
+pandas
+numpy
+yfinance
+holidays
+pdfplumber
+
+# Selenium
+selenium
+webdriver-manager
+
+# LLM
+google-genai
+groq
+
+# Telegram
+python-telegram-bot==22.7
+
+# Utilities
+python-dotenv

@@ -17,6 +17,7 @@
 """
 
 import requests
+import feedparser
 import pandas as pd
 import pdfplumber
 import io
@@ -29,6 +30,9 @@ from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 
 # 引入你專案寫好的資料庫連線工具與 SQLAlchemy
@@ -42,6 +46,7 @@ from sqlalchemy import text
 
 load_dotenv()
 GEMINI_KEY   = os.getenv("GEMINI_API_KEY")  # 從 .env 安全讀取金鑰
+GROQ_KEY     = os.getenv("GROQ_API_KEY")
 USE_LLM      = True                         # 啟用 LLM
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
@@ -50,6 +55,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 MIN_INSTITUTIONAL_BUY = 100_000        # 只排雜訊（100張），靠金額排序+量比過濾做真正篩選
 VOL_RATIO_THRESHOLD   = 1.2            # 放寬量比，避免大型股因難以爆量被剔除
 DAYS_AHEAD_CALENDAR   = 7              # 法說會日曆看未來幾天
+MIN_VOLATILITY        = 20.0           # 年化波動率門檻（%），低於此值視為存股型，排除
 
 # 持股監控條件
 STOP_LOSS_PCT    = 0.93   # 停損：跌 7%
@@ -90,10 +96,32 @@ def get_db():
 
 def get_chrome_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    driver = webdriver.Chrome(options=options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return driver
+
+
+def get_chrome_driver_offscreen():
+    """非 headless，用於需要真實渲染的頁面（如 MOPS PDF）。視窗會短暫出現後自動關閉。"""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
 
 
@@ -314,21 +342,31 @@ def calc_indicators(conn, stock_id: str, days: int = 60) -> dict:
     latest = df.iloc[-1]
     prev   = df.iloc[-2] if len(df) > 1 else latest
 
+    # 年化波動率（近60天，低於 20% 視為低波動存股型）
+    volatility = float(df["close"].pct_change().std() * (252 ** 0.5) * 100)
+
     return {
-        "stock_id":  stock_id,
-        "close":     latest["close"],
-        "ma5":       latest["ma5"],
-        "ma20":      latest["ma20"],
-        "ma60":      latest["ma60"],
-        "vol_ratio": latest["vol_ratio"],
-        "rsi":       latest["rsi"],
-        "ma20_up":   latest["ma20"] > prev["ma20"],   # 月線向上
+        "stock_id":   stock_id,
+        "close":      latest["close"],
+        "ma5":        latest["ma5"],
+        "ma20":       latest["ma20"],
+        "ma60":       latest["ma60"],
+        "vol_ratio":  latest["vol_ratio"],
+        "rsi":        latest["rsi"],
+        "volatility": round(volatility, 1),           # 年化波動率 %
+        "ma20_up":    latest["ma20"] > prev["ma20"],
         "above_ma20": latest["close"] > latest["ma20"],
         "above_ma5":  latest["close"] > latest["ma5"],
-        "golden_cross": (                              # 多頭排列
+        "golden_cross": (
             latest["close"] > latest["ma5"] > latest["ma20"]
         ),
     }
+
+
+def is_low_volatility(ind: dict) -> bool:
+    """判斷是否為低波動存股型（年化波動率 < MIN_VOLATILITY）"""
+    v = ind.get("volatility")
+    return v is not None and v < MIN_VOLATILITY
 
 
 # ════════════════════════════════════════════════════════════════
@@ -473,8 +511,15 @@ def screen_institutional(conn) -> tuple:
                     "indicators": {},
                     "momentum_tag": momentum_tag, "change_5d": chg,
                     "consec_foreign_days": consec_days,
+                    "revenue_trend": get_revenue_trend(conn, stock_id),
+                    "eps_trend":     get_eps_trend(conn, stock_id),
                 })
                 log(f"  ⚠️ [{label}] {stock_id} {name}：{detail_extra}，無技術指標（score=1）[{momentum_tag} {chg:+.1f}%]")
+                continue
+
+            # 排除低波動存股型
+            if is_low_volatility(ind):
+                log(f"  ⏭️  [{label}] {stock_id} {name}：年化波動率 {ind.get('volatility')}% < {MIN_VOLATILITY}%，存股型排除")
                 continue
 
             above_ma20 = ind.get("above_ma20", False)
@@ -591,6 +636,11 @@ def screen_news_hot(conn) -> list:
         cnt = info["count"]
         if cnt >= 3:
             name = info.get("name") or STOCK_NAME_MAP.get(stock_id, stock_id)
+            ind_c = calc_indicators(conn, stock_id) or {}
+            # 排除低波動存股型
+            if is_low_volatility(ind_c):
+                log(f"  ⏭️  {stock_id} {name}：年化波動率 {ind_c.get('volatility')}%，存股型排除")
+                continue
             # 按提及次數給分：10次以上=3分，5次以上=2分，其餘=1分
             if cnt >= 10:
                 score = 3
@@ -604,7 +654,9 @@ def screen_news_hot(conn) -> list:
                 "source":   "輿情熱門",
                 "score":    score,
                 "detail":   f"新聞提及 {cnt} 次：{info['titles'][0]}",
-                "indicators": calc_indicators(conn, stock_id),
+                "indicators":    ind_c,
+                "revenue_trend": get_revenue_trend(conn, stock_id),
+                "eps_trend":     get_eps_trend(conn, stock_id),
             })
             log(f"  ✅ {stock_id} {name}：提及 {cnt} 次（score={score}）")
 
@@ -620,7 +672,7 @@ def get_market_environment(conn) -> dict:
                 FROM us_daily_prices
                 WHERE ticker = '^TWII'
                 ORDER BY date DESC
-                LIMIT 60
+                LIMIT 80
             """)).fetchall()
     except Exception as e:
         log(f"  ⚠️ 大盤資料讀取失敗：{e}")
@@ -631,7 +683,13 @@ def get_market_environment(conn) -> dict:
 
     df = pd.DataFrame(rows, columns=["date", "close", "volume"])
     df = df.sort_values("date").reset_index(drop=True)
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["close"]  = pd.to_numeric(df["close"],  errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    # 排除 close=None 或 volume=0（盤中未收盤資料）
+    df = df[(df["close"].notna()) & (df["volume"] > 0)].reset_index(drop=True)
+
+    if len(df) < 20:
+        return {"trend": "資料不足", "score": 0, "summary": "大盤有效資料不足 20 天"}
 
     close   = float(df["close"].iloc[-1])
     ma20    = float(df["close"].rolling(20).mean().iloc[-1])
@@ -701,31 +759,50 @@ def screen_macro_events(conn) -> tuple[list, str]:
 - 最多列出 3 個事件，每個事件最多 5 支股票"""
 
     try:
-        # 從 DB 抓今日新聞標題作為宏觀分析素材
+        # 從 DB 抓近期新聞標題作為宏觀分析素材（含時間，讓 LLM 判斷最新狀態）
         with conn.engine.connect() as db_conn:
             news_rows = db_conn.execute(text("""
-                SELECT title FROM market_intelligence
-                WHERE publish_date >= CURRENT_DATE - INTERVAL '1 days'
+                SELECT title, DATE(publish_date) as pub_date FROM market_intelligence
+                WHERE publish_date >= CURRENT_DATE - INTERVAL '3 days'
+                  AND publish_date < CURRENT_DATE
                 ORDER BY publish_date DESC
-                LIMIT 30
+                LIMIT 400
             """)).fetchall()
-        news_titles = "\n".join(f"- {r[0]}" for r in news_rows)
 
-        if not news_titles:
+        if not news_rows:
             log("  ⚠️ 無今日新聞資料，略過宏觀掃描")
             return [], ""
 
-        prompt += f"\n\n今日新聞標題（請從中識別宏觀事件）：\n{news_titles}"
+        # 按日期分組，讓 LLM 清楚知道哪些是最新消息
+        from itertools import groupby
+        news_by_date = {}
+        for title, pub_date in news_rows:
+            key = str(pub_date)
+            news_by_date.setdefault(key, []).append(title)
+
+        news_section = ""
+        for date_str in sorted(news_by_date.keys(), reverse=True):
+            label = "【今日】" if date_str == str(datetime.now().date()) else f"【{date_str}】"
+            titles = "\n".join(f"  - {t}" for t in news_by_date[date_str])
+            news_section += f"\n{label}\n{titles}\n"
+
+        prompt += f"\n\n近期新聞（時間由新到舊，若同一事件有新舊衝突請以最新為準）：{news_section}"
         raw = call_gemini(prompt).strip()
 
         # 解析 JSON
         import json, re
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
-            log(f"  ⚠️ 宏觀掃描回應格式錯誤，略過")
+            log(f"  ⚠️ 宏觀掃描回應格式錯誤（找不到 JSON）")
+            log(f"  ⚠️ 原始回應：{raw[:300]}")
             return [], ""
 
-        data         = json.loads(json_match.group())
+        try:
+            data = json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            log(f"  ⚠️ 宏觀掃描 JSON 解析失敗：{e}")
+            log(f"  ⚠️ 原始回應：{raw[:300]}")
+            return [], ""
         macro_summary = data.get("summary", "")
         events        = data.get("events", [])
 
@@ -741,13 +818,18 @@ def screen_macro_events(conn) -> tuple[list, str]:
                 seen_ids.add(stock_id)
                 name = STOCK_NAME_MAP.get(stock_id, stock_id)
                 ind  = calc_indicators(conn, stock_id) or {}
+                if is_low_volatility(ind):
+                    log(f"    ⏭️  {stock_id} {name}：年化波動率 {ind.get('volatility')}%，存股型排除")
+                    continue
                 candidates.append({
-                    "stock_id":   stock_id,
-                    "name":       name,
-                    "source":     "宏觀事件",
-                    "score":      2,
-                    "detail":     f"宏觀事件：{event.get('title','')}（{event.get('impact','')}）",
-                    "indicators": ind,
+                    "stock_id":      stock_id,
+                    "name":          name,
+                    "source":        "宏觀事件",
+                    "score":         2,
+                    "detail":        f"宏觀事件：{event.get('title','')}（{event.get('impact','')}）",
+                    "indicators":    ind,
+                    "revenue_trend": get_revenue_trend(conn, stock_id),
+                    "eps_trend":     get_eps_trend(conn, stock_id),
                 })
                 log(f"    ✅ {stock_id} {name}")
 
@@ -769,6 +851,10 @@ def screen_event_calendar(conn, upcoming_list: list) -> list:
     for item in upcoming_list:
         if today <= item["date"] <= cutoff:
             ind = calc_indicators(conn, item["stock_id"]) or {}
+            # 排除低波動存股型
+            if is_low_volatility(ind):
+                log(f"  ⏭️  {item['stock_id']} {item['name']}：年化波動率 {ind.get('volatility')}%，存股型排除")
+                continue
             # 技術面過濾：跌破月線且非大型股，直接跳過，避免塞滿候選池
             if ind and not ind.get("above_ma20") and ind.get("close", 0) <= 100:
                 log(f"  ⏭️  {item['stock_id']} {item['name']}：跌破月線，略過")
@@ -779,7 +865,9 @@ def screen_event_calendar(conn, upcoming_list: list) -> list:
                 "source":   "法說會事件",
                 "score":    2,
                 "detail":   f"{item['date_str']} {item['time']} 法說會",
-                "indicators": ind,
+                "indicators":    ind,
+                "revenue_trend": get_revenue_trend(conn, item["stock_id"]),
+                "eps_trend":     get_eps_trend(conn, item["stock_id"]),
             })
             log(f"  ✅ {item['stock_id']} {item['name']}：{item['date_str']} 法說會")
 
@@ -850,80 +938,205 @@ def merge_candidates(buckets: dict) -> list:
 # 📄  外部資料抓取（法說會、分點）
 # ════════════════════════════════════════════════════════════════
 
+def fetch_stock_news(stock_id: str, company_name: str, days: int = 7) -> list[str]:
+    """
+    從 DB 搜尋個股新聞；若 DB 無資料，fallback 用 Google News RSS 即時抓。
+    回傳最近 `days` 天內的新聞標題列表（最多 15 筆）。
+    """
+    titles = []
+
+    # --- 1. 先查 DB（用股票代號 OR 公司名模糊搜尋）---
+    try:
+        with get_db_client() as conn:
+            with conn.engine.connect() as db_conn:
+                rows = db_conn.execute(text(f"""
+                    SELECT title FROM market_intelligence
+                    WHERE publish_date >= CURRENT_DATE - INTERVAL '{days} days'
+                      AND (title LIKE :name OR title LIKE :sid)
+                    ORDER BY publish_date DESC
+                    LIMIT 15
+                """), {"name": f"%{company_name[:3]}%", "sid": f"%{stock_id}%"}).fetchall()
+        titles = [r[0] for r in rows if r[0]]
+    except Exception as e:
+        log(f"  ⚠️ DB 個股新聞查詢失敗：{e}")
+
+    # --- 2. DB 無資料時，fallback Google News RSS ---
+    if not titles:
+        log(f"  📡 DB 無個股新聞，改用 Google News RSS 即時抓（{company_name}）...")
+        try:
+            q = f"{company_name} {stock_id}"
+            rss_url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+            res = requests.get(rss_url, timeout=10,
+                               headers={"User-Agent": "Mozilla/5.0"})
+            feed = feedparser.parse(res.content)
+            cutoff = datetime.now() - timedelta(days=days)
+            for entry in feed.entries[:20]:
+                try:
+                    pub = datetime(*entry.published_parsed[:6])
+                    if pub >= cutoff:
+                        titles.append(entry.title)
+                except Exception:
+                    titles.append(entry.title)
+            if titles:
+                log(f"  📰 Google News 抓到 {len(titles)} 筆個股新聞")
+            else:
+                log(f"  ⚠️ Google News 也無近期新聞")
+        except Exception as e:
+            log(f"  ⚠️ Google News RSS 失敗：{e}")
+
+    return titles[:15]
+
+
+def _broker_fallback_from_db(stock_id: str) -> str:
+    """histock 無法存取時，改從 DB 抓三大法人近5日資料"""
+    try:
+        with get_db_client() as conn:
+            with conn.engine.connect() as db_conn:
+                rows = db_conn.execute(text("""
+                    SELECT date, foreign_investor, investment_trust, dealer, total
+                    FROM tw_institutional_trades
+                    WHERE stock_id = :sid
+                    ORDER BY date DESC LIMIT 5
+                """), {"sid": stock_id}).fetchall()
+        if not rows:
+            return "無法人資料"
+        lines = ["（來源：DB 三大法人，分點資料需付費）"]
+        lines.append(f"{'日期':<12} {'外資':>8} {'投信':>8} {'自營':>8} {'合計':>8}")
+        for r in rows:
+            lines.append(f"{str(r[0]):<12} {r[1]:>8,} {r[2]:>8,} {r[3]:>8,} {r[4]:>8,}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"法人資料查詢失敗：{e}"
+
+
 def fetch_broker_summary(stock_id: str) -> str:
-    """抓取嗨投資的券商分點買賣超前五名"""
+    """抓取嗨投資的券商分點買賣超（Selenium，等待 JS 載入）"""
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    driver = get_chrome_driver()
     try:
         url = f'https://histock.tw/stock/branch.aspx?no={stock_id}'
-        res = requests.get(
-            url,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-            timeout=10
+        driver.get(url)
+
+        # 攔截登入要求的 Alert
+        try:
+            WebDriverWait(driver, 3).until(EC.alert_is_present())
+            driver.switch_to.alert.dismiss()
+            log("  ⚠️ histock 要求登入，改用 DB 法人資料")
+            driver.quit()
+            return _broker_fallback_from_db(stock_id)
+        except Exception:
+            pass  # 沒有 alert，繼續正常流程
+
+        # 等待表格有資料（最多 15 秒）
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
         )
-        # 使用 io.StringIO 避免 pandas 警告
-        tables = pd.read_html(io.StringIO(res.text))
-        
+        time.sleep(1)  # 多等一秒確保完整載入
+
+        tables = pd.read_html(io.StringIO(driver.page_source))
         results = []
         for t in tables:
             col_str = "".join(str(c) for c in t.columns)
-            if '券商' in col_str or '買' in col_str or '賣' in col_str:
-                t = t.fillna("") # 把 NaN 換成空字串讓排版乾淨
+            if '券商' not in col_str and '買' not in col_str and '賣' not in col_str:
+                continue
+            t = t.fillna("")
+            if len(t) == 0:
+                continue
+
+            # histock 把賣超/買超兩張表橫向合併，欄位名會有 .1 後綴
+            # 拆成左（賣超）和右（買超）分開顯示
+            cols = list(t.columns)
+            left_cols  = [c for c in cols if not str(c).endswith(".1")]
+            right_cols = [c for c in cols if str(c).endswith(".1")]
+
+            if right_cols:
+                # 重命名右側欄位，去掉 .1
+                right_rename = {c: str(c)[:-2] for c in right_cols}
+                left_df  = t[left_cols].head(5)
+                right_df = t[right_cols].rename(columns=right_rename).head(5)
+                results.append("【賣超排行】\n" + left_df.to_string(index=False))
+                results.append("【買超排行】\n" + right_df.to_string(index=False))
+            else:
                 results.append(t.head(5).to_string(index=False))
-                
+
         if results:
-            # 通常前兩個表格就是「買超前15名」與「賣超前15名」，我們各取前 5 轉成文字
-            return "\n\n".join(results[:2])
-        return "無分點資料"
+            return "\n\n".join(results[:4])
+        log(f"  ⚠️ histock 無分點資料，改用 DB 法人資料")
+        return _broker_fallback_from_db(stock_id)
     except Exception as e:
-        return f"分點資料抓取失敗：{e}"
+        log(f"  ⚠️ histock 抓取失敗（{e}），改用 DB 法人資料")
+        return _broker_fallback_from_db(stock_id)
+    finally:
+        driver.quit()
 
 def fetch_conference_pdf(stock_id: str) -> str:
     """用 Selenium 從 MOPS 抓取法說會 PDF 並轉成文字"""
     driver = get_chrome_driver()
+    wait   = WebDriverWait(driver, 15)
     pdf_text = ""
 
     try:
         driver.get("https://mops.twse.com.tw/mops/#/web/t100sb07_1")
-        time.sleep(5)
 
-        inputs  = driver.find_elements(By.TAG_NAME, "input")
-        buttons = driver.find_elements(By.TAG_NAME, "button")
+        # 用 id='co_id' 直接定位查詢欄位
+        target = wait.until(EC.visibility_of_element_located((By.ID, "co_id")))
+        target.click()
+        time.sleep(0.3)
+        target.send_keys(Keys.CONTROL + "a")
+        target.send_keys(Keys.DELETE)
+        target.send_keys(stock_id)
+        target.send_keys(Keys.TAB)
 
-        # 填入股票代號
-        target = inputs[2]
-        driver.execute_script("arguments[0].value = arguments[1]", target, stock_id)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('input'))", target)
-        driver.execute_script("arguments[0].dispatchEvent(new Event('change'))", target)
-        time.sleep(2)
+        # 找查詢按鈕（用文字比對，不用 index）
+        query_btn = None
+        for btn in driver.find_elements(By.TAG_NAME, "button"):
+            if "查詢" in btn.text and btn.is_displayed():
+                query_btn = btn
+                break
+        if not query_btn:
+            log(f"  ⚠️ {stock_id} 找不到查詢按鈕")
+            return ""
 
-        # 點查詢
-        driver.execute_script("arguments[0].click()", buttons[3])
-        time.sleep(4)
+        driver.execute_script("arguments[0].click()", query_btn)
 
-        # 點彈出結果
-        popup = driver.find_element(By.XPATH, "//button[contains(text(),'彈出結果')]")
+        # 等「彈出結果」按鈕出現（純等待，避免 WebDriverWait 干擾 Vue 渲染）
+        time.sleep(15)
+        popup = next(
+            (b for b in driver.find_elements(By.TAG_NAME, "button")
+             if "彈出結果" in b.text and b.is_displayed()),
+            None
+        )
+
+        if not popup:
+            log(f"  ⚠️ {stock_id} 找不到彈出結果按鈕，可能無法說會資料")
+            return ""
+
         driver.execute_script("arguments[0].click()", popup)
-        time.sleep(3)
-        driver.switch_to.window(driver.window_handles[-1])
-        time.sleep(3)
 
-        # 找英文版 PDF（優先）
+        # 等新視窗開啟
+        wait.until(lambda d: len(d.window_handles) > 1)
+        driver.switch_to.window(driver.window_handles[-1])
+
+        # 等 PDF 連結出現
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "a")))
+
+        # 找 PDF 連結（英文版優先）
         pdf_url = None
-        for a in driver.find_elements(By.TAG_NAME, "a"):
-            href = a.get_attribute("href") or ""
+        links = [a.get_attribute("href") or "" for a in driver.find_elements(By.TAG_NAME, "a")]
+        for href in links:
             if href.endswith("E001.pdf"):
                 pdf_url = href
                 break
         if not pdf_url:
-            for a in driver.find_elements(By.TAG_NAME, "a"):
-                href = a.get_attribute("href") or ""
+            for href in links:
                 if ".pdf" in href.lower():
                     pdf_url = href
                     break
 
         if pdf_url:
-            resp = requests.get(pdf_url,
-                                headers={"User-Agent": "Mozilla/5.0"},
-                                timeout=15)
+            resp = requests.get(pdf_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             import logging
             logging.getLogger("pdfminer").setLevel(logging.ERROR)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
@@ -978,6 +1191,7 @@ def extract_key_signals(text: str) -> dict:
         "demand_signals": find_hits(demand_kw),
         "risk_signals":   find_hits(risk_kw),
         "guidance":       find_hits(guidance_kw),
+        "_pdf_text":      text,
     }
 
 
@@ -985,36 +1199,67 @@ def extract_key_signals(text: str) -> dict:
 # 🤖  LLM 整合（Gemini）
 # ════════════════════════════════════════════════════════════════
 
+DEBUG_PROMPT = False   # True 時印出完整 prompt，方便除錯
+
 def call_gemini(prompt: str) -> str:
-    """呼叫 Gemini API，503/429 自動重試（指數退避）"""
+    """呼叫 LLM API，Gemini 優先，503/429 自動切換至 Groq 備援"""
+    if DEBUG_PROMPT:
+        print("\n" + "="*60)
+        print("📤 [PROMPT]")
+        print(prompt)
+        print("="*60 + "\n")
+
     if not USE_LLM or not GEMINI_KEY:
         return "（LLM 未啟用）"
 
     from google import genai
-    client = genai.Client(api_key=GEMINI_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-    wait_times = [10, 30, 60]   # 三次重試：10秒、30秒、60秒
-    for attempt, wait in enumerate(wait_times, 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.1-flash-lite-preview",
-                contents=prompt
-            )
-            time.sleep(5)   # 限制在 15 RPM 以內（每分鐘最多 12 次）
-            return response.text
-        except Exception as e:
-            err = str(e)
-            if "429" in err and "per_minute" in err.lower():
-                log(f"  ⏳ 超過 RPM 限制（第 {attempt} 次），等待 60 秒...")
-                time.sleep(60)
-            elif "503" in err or "429" in err:
-                log(f"  ⏳ Gemini 暫時不可用（第 {attempt} 次），{wait} 秒後重試...")
-                time.sleep(wait)
-            else:
-                log(f"  ❌ LLM 呼叫發生錯誤：{e}")
-                return f"LLM 呼叫失敗：{e}"
+    # 先試 Gemini 系列
+    for model in ['gemini-3.1-flash-lite-preview']:
+        for attempt in range(1, 3):
+            log(f"  🔄 嘗試：{model}（第 {attempt} 次）")
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+                log(f"  ✅ 成功使用：{model}")
+                time.sleep(10)
+                return response.text
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "503" in err or "unavailable" in err.lower():
+                    if attempt < 2:
+                        log(f"  ⏳ 過載，等待 10 秒後重試...")
+                        time.sleep(10)
+                    else:
+                        log(f"  ➡️ 切換備用模型...")
+                else:
+                    log(f"  ❌ LLM 呼叫發生錯誤：{e}")
+                    return f"LLM 呼叫失敗：{e}"
 
-    log("  ❌ Gemini 重試 3 次仍失敗，略過此次分析")
+    # Gemini 全掛 → 改用 Groq
+    if GROQ_KEY:
+        groq_model = "llama-3.1-8b-instant"
+        from groq import Groq
+        groq_client = Groq(api_key=GROQ_KEY)
+        for attempt in range(1, 3):
+            log(f"  🔄 嘗試：Groq / {groq_model}（第 {attempt} 次）")
+            try:
+                resp = groq_client.chat.completions.create(
+                    model=groq_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                )
+                log(f"  ✅ 成功使用：Groq / {groq_model}")
+                return resp.choices[0].message.content
+            except Exception as e:
+                log(f"  ❌ Groq 第 {attempt} 次失敗：{e}")
+                if attempt < 2:
+                    time.sleep(10)
+
+    log("  ❌ 所有模型皆失敗，略過此次分析")
     return "LLM 呼叫失敗：服務暫時不可用"
 
 
@@ -1023,19 +1268,38 @@ def get_company_profile(stock_id: str, name: str) -> str:
     if not USE_LLM or not GEMINI_KEY:
         return ""
 
+    contents = (
+        f"請用1-2句繁體中文描述台股上市公司「{name}」（股票代號 {stock_id}）"
+        f"的主要業務與產品。若不確定，直接寫「業務資料不明」。"
+    )
     try:
         from google import genai
-        client = genai.Client(api_key=GEMINI_KEY)
-        resp = client.models.generate_content(
-            model="gemini-3.1-flash-lite-preview",
-            contents=(
-                f"請用1-2句繁體中文描述台股上市公司「{name}」（股票代號 {stock_id}）"
-                f"的主要業務與產品。若不確定，直接寫「業務資料不明」。"
-            )
-        )
-        return resp.text.strip()
+        gemini_client = genai.Client(api_key=GEMINI_KEY)
+        for model in ['gemini-3.1-flash-lite-preview']:
+            try:
+                resp = gemini_client.models.generate_content(model=model, contents=contents)
+                return resp.text.strip()
+            except Exception as e:
+                if "503" in str(e) or "429" in str(e):
+                    continue
+                break
     except Exception:
-        return ""
+        pass
+
+    if GROQ_KEY:
+        try:
+            from groq import Groq
+            groq_client = Groq(api_key=GROQ_KEY)
+            resp = groq_client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[{"role": "user", "content": contents}],
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    return ""
 
 
 def llm_buy_decision(candidate: dict, conference_signals: dict,
@@ -1063,7 +1327,8 @@ def llm_buy_decision(candidate: dict, conference_signals: dict,
         + (f"，動能階段：{momentum_tag}{momentum_hint}" if momentum_tag else "")
     )
 
-    conf_summary = "\n".join(conference_signals.get("guidance", [])[:3]) or "無法說會資料"
+    _pdf_text = conference_signals.get("_pdf_text", "")
+    conf_summary = _pdf_text[:6000] if _pdf_text else "\n".join(conference_signals.get("guidance", [])[:3]) or "無法說會資料"
     news_summary = "\n".join([n[:80] for n in recent_news[:5]]) or "無近期新聞"
 
     # 針對法說會前夕的動態提示
@@ -1082,7 +1347,7 @@ def llm_buy_decision(candidate: dict, conference_signals: dict,
     eps_section      = f"\n【EPS趨勢】\n{eps_trend_data['summary']}" if eps_trend_data.get("summary") else ""
 
     prompt = f"""
-你是台股短線交易員，根據以下資料對這支股票做出明確的進場決策。
+你是台股波段交易員，操作週期為 1 週～1 個月，根據以下資料對這支股票做出明確的進場決策。
 
 股票：{candidate['name']}（{candidate['stock_id']}）
 篩選來源：{', '.join(candidate.get('sources', []))}
@@ -1168,9 +1433,13 @@ def llm_buy_decision(candidate: dict, conference_signals: dict,
             if val in ("高", "中", "低"):
                 result["confidence"] = val
 
-    # 若解析不到行動，記 log 並預設觀望
+    # 檢查關鍵欄位是否解析成功
+    missing = [k for k in ("action", "reason", "risk") if not result[k]]
+    if missing:
+        log(f"  ⚠️ LLM 回應格式不完整，缺少：{', '.join(missing)}")
+        log(f"  ⚠️ 原始回應：{response[:300]}")
+
     if not result["action"]:
-        log(f"  ⚠️ 解析失敗，原始回應：{response[:200]}")
         result["action"] = "觀望"
 
     return result
@@ -1432,11 +1701,11 @@ def monitor_holdings(conn):
                     sell_rows = db_conn.execute(text("""
                         SELECT COUNT(*) FROM tw_institutional_trades
                         WHERE stock_id = :sid
-                          AND date >= CURRENT_DATE - INTERVAL '3 days'
+                          AND date >= CURRENT_DATE - INTERVAL '5 days'
                           AND total < -1000000
                     """), {"sid": stock_id}).fetchone()
-                if sell_rows and sell_rows[0] >= 2:
-                    sell_reason = "法人連續賣超 2 天"
+                if sell_rows and sell_rows[0] >= 3:
+                    sell_reason = "法人連續賣超 3 天"
 
             # ── LLM 消息面監控 ──
             if not sell_reason and USE_LLM:
@@ -1636,13 +1905,9 @@ def run_daily_agent():
             conf_signals = {"sentiment": "無資料", "guidance": []}
             log("  法說會：無資料")
 
-        # 抓近期新聞
-        with conn.engine.connect() as db_conn:
-            news_rows = db_conn.execute(text("""
-                SELECT title FROM market_intelligence
-                WHERE publish_date >= CURRENT_DATE - INTERVAL '3 days'
-            """)).fetchall()
-        news_list = [r[0] for r in news_rows if c["name"] in r[0]]
+        # 抓近期個股新聞（DB 優先，無資料時 fallback Google News RSS）
+        news_list = fetch_stock_news(stock_id, name, days=7)
+        log(f"  📰 個股新聞：{len(news_list)} 筆")
 
         # 抓主力分點
         log("  抓取主力分點資料...")

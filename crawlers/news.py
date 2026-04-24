@@ -44,8 +44,10 @@ class NewsBase(BaseCrawler):
         absolute_floor_date = today - timedelta(days=max_history_days)
 
         if mode == "daily":
-            # 強制只抓最近 3 天
-            return today, today - timedelta(days=3)
+            # 只抓到昨天結束（23:59:59），確保昨天全天資料完整
+            yesterday_end   = today.replace(hour=23, minute=59, second=59) - timedelta(days=1)
+            three_days_ago  = today.replace(hour=0,  minute=0,  second=0)  - timedelta(days=4)
+            return yesterday_end, three_days_ago
         
         try:
             with get_db_client() as db:
@@ -195,22 +197,36 @@ class PTTCrawler(NewsBase):
                     title_div = art.select_one("div.title a")
                     if not title_div: continue
                     title = title_div.text.strip()
+                    if title.startswith("Re:"): continue
                     if not any(k in title for k in ["[新聞]", "[標的]", "[情報]", "盤中", "大盤"]): continue
                     
-                    date_str = art.select_one("div.date").text.strip()
+                    link = "https://www.ptt.cc" + title_div['href']
+
+                    # 從 URL 解析精確時間（e.g. /bbs/Stock/M.1744123456.A.123.html）
                     try:
-                        m, d = map(int, date_str.split('/'))
-                        pub_date = datetime(datetime.now().year, m, d)
-                        if datetime.now().month==1 and m==12: pub_date = pub_date.replace(year=datetime.now().year-1)
-                        if pub_date > datetime.now() + timedelta(days=1): pub_date = pub_date.replace(year=datetime.now().year-1)
-                        
-                        min_date_in_page = min(min_date_in_page, pub_date)
-                    except: pub_date = datetime.now()
-                    
-                    # 🔥 關鍵修正：確保只抓取我們需要的「缺口時間」的資料
-                    # 避免已經存在資料庫的資料又被抓出來 Upsert，造成一直重複新增的錯覺
+                        import re as _re
+                        ts_match = _re.search(r'/M\.(\d+)\.', title_div['href'])
+                        if ts_match:
+                            pub_date = datetime.fromtimestamp(int(ts_match.group(1)))
+                        else:
+                            raise ValueError("no timestamp in URL")
+                    except:
+                        # fallback：用列表頁的月/日
+                        date_str = art.select_one("div.date").text.strip()
+                        try:
+                            m, d = map(int, date_str.split('/'))
+                            pub_date = datetime(datetime.now().year, m, d)
+                            if datetime.now().month == 1 and m == 12:
+                                pub_date = pub_date.replace(year=datetime.now().year - 1)
+                            if pub_date > datetime.now() + timedelta(days=1):
+                                pub_date = pub_date.replace(year=datetime.now().year - 1)
+                        except:
+                            pub_date = datetime.now()
+
+                    min_date_in_page = min(min_date_in_page, pub_date)
+
+                    # 確保只抓取缺口時間的資料
                     if limit_dt <= pub_date <= current_end:
-                        link = "https://www.ptt.cc" + title_div['href']
                         news_list.append({
                             "url_hash": hashlib.sha256(link.encode()).hexdigest(),
                             "publish_date": pub_date, "title": title, "url": link, "source": "PTT_Stock"

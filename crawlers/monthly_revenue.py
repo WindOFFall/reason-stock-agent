@@ -108,19 +108,22 @@ def get_stock_list(conn) -> list:
 
 
 def get_already_fetched(conn) -> set:
-    """已經在 tw_monthly_revenue 裡有資料的股票"""
+    """已有上個月實際營收資料（以 revenue_year/revenue_month 判斷）的股票"""
     try:
         with conn.engine.connect() as db:
-            rows = db.execute(text(
-                "SELECT DISTINCT stock_id FROM tw_monthly_revenue"
-            )).fetchall()
+            rows = db.execute(text("""
+                SELECT DISTINCT stock_id FROM tw_monthly_revenue
+                WHERE (revenue_year * 100 + revenue_month) >=
+                      (EXTRACT(YEAR FROM CURRENT_DATE - INTERVAL '1 month')::int * 100
+                       + EXTRACT(MONTH FROM CURRENT_DATE - INTERVAL '1 month')::int)
+            """)).fetchall()
         return {r[0] for r in rows}
     except Exception:
         return set()  # 表不存在，全部都要抓
 
 
 def save_to_db(conn, df: pd.DataFrame):
-    """存進 DB（upsert）"""
+    """存進 DB（upsert，主鍵衝突時略過）"""
     if df.empty:
         return
 
@@ -128,29 +131,27 @@ def save_to_db(conn, df: pd.DataFrame):
     df   = df[[c for c in keep if c in df.columns]].copy()
     df['date'] = pd.to_datetime(df['date'])
 
-    # 第一次會自動建表
-    df.to_sql('tw_monthly_revenue', conn.engine,
-              if_exists='append', index=False,
-              method='multi')
+    # 確保表與主鍵存在
+    with conn.engine.begin() as db:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS tw_monthly_revenue (
+                stock_id      TEXT,
+                date          DATE,
+                revenue       BIGINT,
+                revenue_month INT,
+                revenue_year  INT,
+                PRIMARY KEY (stock_id, date)
+            )
+        """))
 
-    # 建主鍵（只有第一次需要，之後 IF NOT EXISTS 直接跳過）
-    try:
-        with conn.engine.begin() as db:
-            db.execute(text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint
-                        WHERE conname = 'pk_monthly_revenue'
-                    ) THEN
-                        ALTER TABLE tw_monthly_revenue
-                        ADD CONSTRAINT pk_monthly_revenue
-                        PRIMARY KEY (stock_id, date);
-                    END IF;
-                END $$;
-            """))
-    except Exception:
-        pass  # 主鍵已存在
+    # upsert：衝突時略過（不覆蓋舊資料）
+    rows = df.to_dict(orient='records')
+    with conn.engine.begin() as db:
+        db.execute(text("""
+            INSERT INTO tw_monthly_revenue (stock_id, date, revenue, revenue_month, revenue_year)
+            VALUES (:stock_id, :date, :revenue, :revenue_month, :revenue_year)
+            ON CONFLICT (stock_id, date) DO NOTHING
+        """), rows)
 
 
 def run():
@@ -165,13 +166,28 @@ def run():
     conn    = get_db_client()
     limiter = RateLimiter(MAX_PER_HOUR)
 
+    # 診斷：顯示 DB 內實際最新的營收月份
+    try:
+        with conn.engine.connect() as db:
+            row = db.execute(text("""
+                SELECT revenue_year, revenue_month FROM tw_monthly_revenue
+                ORDER BY revenue_year DESC, revenue_month DESC
+                LIMIT 1
+            """)).fetchone()
+        if row:
+            log(f"📅 DB 內最新營收月份：{row[0]}年{row[1]}月")
+        else:
+            log("📅 DB 內尚無 tw_monthly_revenue 資料")
+    except Exception:
+        log("📅 DB 內尚無 tw_monthly_revenue 資料表")
+
     all_stocks     = get_stock_list(conn)
     already_done   = get_already_fetched(conn)
     need_fetch     = [s for s in all_stocks if s not in already_done]
 
     log(f"全部股票：{len(all_stocks)} 支")
-    log(f"已有資料：{len(already_done)} 支")
-    log(f"待補齊：  {len(need_fetch)} 支")
+    log(f"已有上月資料：{len(already_done)} 支")
+    log(f"待補齊：      {len(need_fetch)} 支")
 
     if not need_fetch:
         log("✅ 所有股票都已有資料，無需補充")

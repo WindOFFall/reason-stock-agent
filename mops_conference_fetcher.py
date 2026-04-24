@@ -12,7 +12,7 @@ import pdfplumber
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -29,7 +29,7 @@ load_dotenv()
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")   # ← 替換成你的 key
-genai.configure(api_key=GEMINI_API_KEY)
+_genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ────────────────────────────────────────────
@@ -222,8 +222,6 @@ def download_and_parse_pdf(pdf_url: str) -> str:
 # Gemini API：PDF 文字 → 結構化 JSON
 # ────────────────────────────────────────────
 def extract_structured_content(pdf_text: str, lang: str = "zh") -> dict:
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
     lang_hint = "英文" if lang == "en" else "繁體中文"
 
     prompt = f"""
@@ -247,7 +245,10 @@ def extract_structured_content(pdf_text: str, lang: str = "zh") -> dict:
 """
 
     try:
-        response = model.generate_content(prompt)
+        response = _genai_client.models.generate_content(
+            model="gemini-3.1-flash-lite-preview",
+            contents=prompt,
+        )
         raw = response.text.strip()
 
         # 去除可能的 ```json 包裝

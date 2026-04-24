@@ -4,14 +4,24 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.keys import Keys
 import time
 from datetime import datetime
+from sqlalchemy import text
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from database import get_db_client
 
 def get_chrome_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    return webdriver.Chrome(options=options)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    driver = webdriver.Chrome(options=options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return driver
 
 
 def query_single_market(market_name, roc_year):
@@ -84,6 +94,12 @@ def query_single_market(market_name, roc_year):
 
         rows = tables[0].find_elements(By.TAG_NAME, "tr")
         print(f"  找到 {len(rows)} 行")
+        # 印出表頭，確認有哪些欄位
+        if rows:
+            headers = [th.text.strip() for th in rows[0].find_elements(By.TAG_NAME, "th")]
+            if not headers:
+                headers = [td.text.strip() for td in rows[0].find_elements(By.TAG_NAME, "td")]
+            print(f"  表頭欄位：{headers}")
 
         for row in rows[2:]:
             cols = row.find_elements(By.TAG_NAME, "td")
@@ -166,4 +182,57 @@ def tool_get_upcoming_conferences():
     return upcoming, all_results
 
 
-upcoming, all_data = tool_get_upcoming_conferences()
+def save_to_db(records: list):
+    """將法說會時程存進 mops_conference_calendar，upsert by (stock_id, conf_date)"""
+    if not records:
+        return
+    with get_db_client() as db:
+        with db.engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mops_conference_calendar (
+                    stock_id    TEXT,
+                    name        TEXT,
+                    market      TEXT,
+                    conf_date   DATE,
+                    conf_time   TEXT,
+                    pdf_zh      TEXT,
+                    pdf_en      TEXT,
+                    fetched_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (stock_id, conf_date)
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO mops_conference_calendar
+                    (stock_id, name, market, conf_date, conf_time, pdf_zh, pdf_en, fetched_at)
+                VALUES
+                    (:stock_id, :name, :market, :conf_date, :conf_time, :pdf_zh, :pdf_en, CURRENT_TIMESTAMP)
+                ON CONFLICT (stock_id, conf_date) DO UPDATE SET
+                    name       = EXCLUDED.name,
+                    market     = EXCLUDED.market,
+                    conf_time  = EXCLUDED.conf_time,
+                    pdf_zh     = EXCLUDED.pdf_zh,
+                    pdf_en     = EXCLUDED.pdf_en,
+                    fetched_at = CURRENT_TIMESTAMP
+            """), [
+                {
+                    "stock_id":  r["stock_id"],
+                    "name":      r["name"],
+                    "market":    r["market"],
+                    "conf_date": r["date"].strftime("%Y-%m-%d"),
+                    "conf_time": r["time"],
+                    "pdf_zh":    r["pdf_zh"],
+                    "pdf_en":    r["pdf_en"],
+                }
+                for r in records
+            ])
+    print(f"  💾 已儲存 {len(records)} 筆法說會時程至 DB")
+
+
+def run():
+    upcoming, all_data = tool_get_upcoming_conferences()
+    save_to_db(all_data)
+    return upcoming, all_data
+
+
+if __name__ == '__main__':
+    upcoming, all_data = run()
