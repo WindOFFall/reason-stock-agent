@@ -53,4 +53,5 @@ output_data/
 .DS_Store
 Thumbs.db
 *.ipynb
-.ipynb_checkpoints/
+.ipynb_checkpoints/node_modules/
+web/node_modules/
