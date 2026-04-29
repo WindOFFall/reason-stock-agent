@@ -264,3 +264,112 @@ class USStockCrawler(BaseCrawler):
                 except Exception as e:
                     print(f"   ❌ 錯誤 {ticker}: {e}"); time.sleep(2)
         self.save_system_log("SUCCESS", f"美股執行完畢 ({mode})")
+
+
+# ==========================================
+# 亞股爬蟲（韓股 + 日股，使用 yfinance）
+# ==========================================
+class AsiaStockCrawler(BaseCrawler):
+    def __init__(self):
+        super().__init__("Asia_Stock")
+        self.column_map = {
+            "Date": "date", "Open": "open", "High": "high", "Low": "low",
+            "Close": "close", "Adj Close": "adj_close", "Volume": "volume"
+        }
+        # 韓股：.KS = KOSPI，.KQ = KOSDAQ
+        # 日股：.T = 東京證交所
+        self.target_tickers = {
+            # 韓股指數
+            "^KS11":     "KOSPI",
+            "^KQ11":     "KOSDAQ",
+            # 韓股個股
+            "005930.KS": "삼성전자",
+            "000660.KS": "SK하이닉스",
+            "005380.KS": "현대차",
+            "035720.KS": "카카오",
+            "000270.KS": "기아",
+            # 日股指數
+            "^N225":     "Nikkei 225",
+            # 日股個股
+            "7203.T":    "Toyota",
+            "6758.T":    "Sony",
+            "9984.T":    "SoftBank",
+            "7974.T":    "Nintendo",
+            "6861.T":    "Keyence",
+        }
+
+    def _init_tables(self, db):
+        db.execute_raw("""
+            CREATE TABLE IF NOT EXISTS asia_daily_prices (
+                date       DATE,
+                ticker     VARCHAR(20),
+                open       NUMERIC,
+                high       NUMERIC,
+                low        NUMERIC,
+                close      NUMERIC,
+                adj_close  NUMERIC,
+                volume     BIGINT,
+                PRIMARY KEY (date, ticker)
+            );
+        """)
+        db.execute_raw("""
+            CREATE TABLE IF NOT EXISTS asia_update_logs (
+                ticker VARCHAR(20) PRIMARY KEY,
+                last_updated_date DATE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+    def _clean_data(self, df, ticker):
+        df = df.reset_index()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+        available = [c for c in self.column_map.keys() if c in df.columns]
+        df = df[available].copy()
+        df.rename(columns=self.column_map, inplace=True)
+        df['ticker'] = ticker
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        return df
+
+    def run(self, mode="daily", days_back=365):
+        print(f"🚀 [亞股] 模式: {mode}...")
+        with get_db_client() as db:
+            self._init_tables(db)
+            log_df = db.fetch("asia_update_logs")
+            last_update_map = dict(zip(log_df['ticker'], log_df['last_updated_date'])) if not log_df.empty else {}
+
+            for ticker in self.target_tickers:
+                if mode == "daily":
+                    last_date = last_update_map.get(ticker)
+                    start_date = last_date if last_date else datetime.now().date() - timedelta(days=30)
+                else:
+                    print(f"   [回補] 強制重抓 {ticker} 過去 {days_back} 天...")
+                    start_date = datetime.now().date() - timedelta(days=days_back)
+
+                if start_date > datetime.now().date():
+                    continue
+
+                try:
+                    flag = "🇰🇷" if ticker.endswith(".KS") or ticker.endswith(".KQ") or ticker in ("^KS11","^KQ11") else "🇯🇵"
+                    print(f"   {flag} 下載 {ticker} ({self.target_tickers[ticker]}): {start_date} ~ Today")
+                    df = yf.download(ticker, start=start_date, progress=False, auto_adjust=False)
+                    if df.empty:
+                        print("      ⚠️ 無資料")
+                        continue
+
+                    final_df = self._clean_data(df, ticker)
+                    final_df.drop_duplicates(subset=['date', 'ticker'], keep='last', inplace=True)
+                    count = db.upsert_from_df(table="asia_daily_prices", df=final_df, on=["date", "ticker"])
+                    print(f"      ✅ 寫入: {count} 筆")
+
+                    latest_date = final_df['date'].max()
+                    current_log_date = last_update_map.get(ticker)
+                    if current_log_date is None or latest_date > current_log_date:
+                        log_data = pd.DataFrame([{"ticker": ticker, "last_updated_date": latest_date}])
+                        db.upsert_from_df("asia_update_logs", log_data, on=["ticker"])
+                    time.sleep(random.uniform(1, 2))
+                except Exception as e:
+                    print(f"   ❌ 錯誤 {ticker}: {e}")
+                    time.sleep(2)
+
+        self.save_system_log("SUCCESS", f"亞股執行完畢 ({mode})")

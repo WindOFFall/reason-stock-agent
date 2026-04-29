@@ -1,0 +1,123 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg:        #080c14;
+  --bg2:       #0d1220;
+  --bg3:       #111827;
+  --border:    rgba(0, 212, 255, 0.15);
+  --cyan:      #00d4ff;
+  --cyan-dim:  rgba(0, 212, 255, 0.08);
+  --green:     #00ff88;
+  --red:       #ff4d6d;
+  --text:      #c8d6e5;
+  --text-dim:  #5a7080;
+  --gold:      #f6c90e;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'Microsoft JhengHei', 'Segoe UI', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Element Plus 覆寫 ───────────────────────── */
+
+/* 卡片 */
+.el-card {
+  background: var(--bg2) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 0 24px rgba(0, 212, 255, 0.04) !important;
+}
+.el-card__header {
+  background: transparent !important;
+  border-bottom: 1px solid var(--border) !important;
+  color: var(--cyan) !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: 1px !important;
+  text-transform: uppercase !important;
+  padding: 12px 16px !important;
+}
+.el-card__body { padding: 16px !important; }
+
+/* 表格 */
+.el-table {
+  background: transparent !important;
+  color: var(--text) !important;
+  --el-table-bg-color: transparent !important;
+  --el-table-tr-bg-color: transparent !important;
+  --el-table-header-bg-color: rgba(0,212,255,0.06) !important;
+  --el-table-header-text-color: var(--cyan) !important;
+  --el-table-border-color: var(--border) !important;
+  --el-table-row-hover-bg-color: rgba(0,212,255,0.04) !important;
+  --el-table-text-color: var(--text) !important;
+  --el-fill-color-lighter: transparent !important;
+}
+.el-table th { font-weight: 600 !important; }
+.el-table--striped .el-table__body tr.el-table__row--striped td {
+  background: rgba(0,212,255,0.03) !important;
+}
+
+/* 按鈕 */
+.el-button--primary {
+  background: linear-gradient(135deg, #00b4d8, #00d4ff) !important;
+  border-color: transparent !important;
+  color: #080c14 !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.5px !important;
+  box-shadow: 0 0 16px rgba(0,212,255,0.3) !important;
+}
+.el-button--primary:hover {
+  box-shadow: 0 0 24px rgba(0,212,255,0.5) !important;
+  transform: translateY(-1px);
+}
+
+/* 輸入框 */
+.el-input__wrapper {
+  background: var(--bg3) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  box-shadow: none !important;
+}
+.el-input__wrapper:hover, .el-input__wrapper.is-focus {
+  border-color: var(--cyan) !important;
+  box-shadow: 0 0 8px rgba(0,212,255,0.2) !important;
+}
+.el-input__inner { color: var(--text) !important; }
+
+/* Select */
+.el-select__wrapper {
+  background: var(--bg3) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  box-shadow: none !important;
+  color: var(--text) !important;
+}
+.el-select__wrapper:hover { border-color: var(--cyan) !important; }
+.el-select-dropdown { background: var(--bg3) !important; border-color: var(--border) !important; }
+.el-select-dropdown__item { color: var(--text) !important; }
+.el-select-dropdown__item.is-hovering { background: var(--cyan-dim) !important; }
+.el-select-dropdown__item.is-selected { color: var(--cyan) !important; }
+
+/* Tag */
+.el-tag { border-radius: 6px !important; font-weight: 600 !important; }
+.el-tag--success { background: rgba(0,255,136,0.12) !important; border-color: rgba(0,255,136,0.3) !important; color: var(--green) !important; }
+.el-tag--info    { background: rgba(0,212,255,0.1)  !important; border-color: rgba(0,212,255,0.3)  !important; color: var(--cyan)  !important; }
+.el-tag--danger  { background: rgba(255,77,109,0.12) !important; border-color: rgba(255,77,109,0.3) !important; color: var(--red)   !important; }
+
+/* Menu */
+.el-menu-item.is-active { background: var(--cyan-dim) !important; }
+.el-menu-item:hover     { background: rgba(0,212,255,0.06) !important; }
+
+/* Empty */
+.el-empty__description p { color: var(--text-dim) !important; }
+
+/* Loading */
+.el-loading-mask { background: rgba(8,12,20,0.8) !important; }
+
+/* Page header */
+.el-page-header { color: var(--text) !important; }
+.el-page-header__title { color: var(--cyan) !important; }

@@ -1216,7 +1216,7 @@ def call_gemini(prompt: str) -> str:
     gemini_client = genai.Client(api_key=GEMINI_KEY)
 
     # 先試 Gemini 系列
-    for model in ['gemini-3.1-flash-lite-preview']:
+    for model in ['gemini-3.1-flash-lite-preview', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']:
         for attempt in range(1, 3):
             log(f"  🔄 嘗試：{model}（第 {attempt} 次）")
             try:
@@ -1275,7 +1275,7 @@ def get_company_profile(stock_id: str, name: str) -> str:
     try:
         from google import genai
         gemini_client = genai.Client(api_key=GEMINI_KEY)
-        for model in ['gemini-3.1-flash-lite-preview']:
+        for model in ['gemini-3.1-flash-lite-preview', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']:
             try:
                 resp = gemini_client.models.generate_content(model=model, contents=contents)
                 return resp.text.strip()
@@ -1959,6 +1959,32 @@ def run_daily_agent():
         candidate_analysis_msg += f"⚠️ 風險：{decision.get('risk', '').replace('<', '〈').replace('>', '〉')}\n"
         candidate_analysis_msg += f"📈 走勢：<a href='{yahoo_url}'>Yahoo 奇摩股市</a>\n\n"
 
+        log(f"  >>> 決策結果：{decision['action']} / {decision['confidence']} (stock={stock_id})")
+
+        # 所有分析結果都寫入 DB（對應 TG 推播內容）
+        ACTION_MAP = {"買進": "BUY", "觀望": "WATCH", "不買": "SKIP"}
+        db_action = ACTION_MAP.get(decision["action"], "SKIP")
+        entry_price = float(c.get("indicators", {}).get("close") or 0)
+        try:
+            with conn.engine.begin() as _db_conn:
+                _db_conn.execute(text("""
+                    INSERT INTO trade_log
+                    (date, stock_id, name, action, entry_price, reason, sources, llm_decision)
+                    VALUES (:date, :stock_id, :name, :action, :entry_price, :reason, :sources, :llm_decision)
+                """), {
+                    "date":         datetime.now().strftime("%Y-%m-%d"),
+                    "stock_id":     stock_id,
+                    "name":         name,
+                    "action":       db_action,
+                    "entry_price":  entry_price,
+                    "reason":       decision.get("reason", ""),
+                    "sources":      json.dumps(c.get("sources", []), ensure_ascii=False),
+                    "llm_decision": json.dumps(decision, ensure_ascii=False),
+                })
+            log(f"  ✅ DB 寫入成功：{stock_id} {db_action}")
+        except Exception as _e:
+            log(f"  ❌ DB 寫入失敗：{stock_id} → {_e}")
+
         if decision["action"] == "買進" and decision["confidence"] in ("高", "中"):
             buy_list.append(c)
 
@@ -1980,6 +2006,18 @@ def run_daily_agent():
             log(f"     風險：{d.get('risk', '')}")
             log(f"     信心：{d.get('confidence', '')}")
             log(f"     走勢：https://tw.stock.yahoo.com/quote/{c['stock_id']}")
+
+            # 寫入資料庫
+            entry_price = float(c.get("indicators", {}).get("close") or 0)
+            add_to_watchlist(
+                conn,
+                stock_id    = c["stock_id"],
+                name        = c["name"],
+                entry_price = entry_price,
+                reason      = d.get("reason", ""),
+                sources     = c.get("sources", []),
+                llm_decision= d,
+            )
 
     # ────────────────────────────────────────
     # 第三階段：持股監控

@@ -210,8 +210,9 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global _analyze_running
         _analyze_running = True
         try:
-            from main import run_daily_agent
-            run_daily_agent()
+            import importlib, main
+            importlib.reload(main)
+            main.run_daily_agent()
         except Exception as e:
             _notify(f"❌ 選股分析失敗：{e}")
         finally:

@@ -368,6 +368,14 @@ def run_all(days_back: int = 7):
     log("\n📋 每日資料管線")
     run_pipeline(days_back=days_back)
 
+    # 亞股（韓股 + 日股）每日更新
+    log("\n🌏 亞股每日更新")
+    try:
+        from crawlers.price import AsiaStockCrawler
+        AsiaStockCrawler().run(mode="daily")
+    except Exception as e:
+        log(f"  ❌ 亞股更新失敗：{e}")
+
 
 if __name__ == "__main__":
     # 預設補查最近 1 個工作日；可改成 3 補連假
