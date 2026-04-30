@@ -133,21 +133,69 @@ def ensure_institutional(target_date: datetime) -> bool:
         return False
 
 
+NEWS_SOURCE_THRESHOLDS = {
+    "Anue":        30,
+    "GoogleNews":  30,
+    "PTT_Stock":   15,
+}
+
+def _check_news_by_source(target_date: datetime) -> dict:
+    """回傳各來源當天實際筆數 {source: count}"""
+    date_str = target_date.strftime("%Y-%m-%d")
+    try:
+        with get_db_client() as db:
+            with db.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT source, COUNT(*) as cnt
+                    FROM market_intelligence
+                    WHERE publish_date::date = :d
+                    GROUP BY source
+                """), {"d": date_str}).fetchall()
+        return {r.source: r.cnt for r in rows}
+    except Exception as e:
+        log(f"  ⚠️ 查詢新聞來源失敗：{e}")
+        return {}
+
+
 def ensure_news(target_date: datetime) -> bool:
-    """確保新聞資料存在（門檻 5 筆）"""
-    if check_table_has_data_v2("market_intelligence", "publish_date", target_date, min_count=5):
-        log(f"  ✅ 新聞資料 {target_date.strftime('%Y-%m-%d')} 已存在")
+    """確保三個新聞來源各自達到門檻（Anue≥20、GoogleNews≥20、PTT≥10）"""
+    date_str = target_date.strftime("%Y-%m-%d")
+    counts = _check_news_by_source(target_date)
+
+    missing = [
+        src for src, threshold in NEWS_SOURCE_THRESHOLDS.items()
+        if counts.get(src, 0) < threshold
+    ]
+
+    if not missing:
+        log(f"  ✅ 新聞資料 {date_str} 完整（"
+            + "、".join(f"{s}:{counts.get(s,0)}筆" for s in NEWS_SOURCE_THRESHOLDS) + "）")
         return True
 
-    log(f"  🔄 新聞資料 {target_date.strftime('%Y-%m-%d')} 缺漏，開始補抓...")
+    log(f"  🔄 新聞資料 {date_str} 不足，補抓來源：{missing}")
+    log(f"     目前：" + "、".join(f"{s}:{counts.get(s,0)}筆" for s in NEWS_SOURCE_THRESHOLDS))
     try:
         from crawlers.news import AnueCrawler, GoogleNewsCrawler, PTTCrawler
-        AnueCrawler().run(mode="backfill", days_back=3)
-        GoogleNewsCrawler().run(keyword="台股", mode="backfill", days_back=3)
-        PTTCrawler().run(mode="backfill", days_back=3)
-        ok = check_table_has_data_v2("market_intelligence", "publish_date", target_date)
-        log(f"  {'✅ 補抓成功' if ok else '⚠️ 補抓後仍無資料'}")
-        return ok
+        if "Anue" in missing:
+            AnueCrawler().run(mode="backfill", days_back=3)
+        if "GoogleNews" in missing:
+            GoogleNewsCrawler().run(keyword="台股", mode="backfill", days_back=3)
+        if "PTT_Stock" in missing:
+            PTTCrawler().run(mode="backfill", days_back=3)
+
+        counts2 = _check_news_by_source(target_date)
+        still_missing = [
+            src for src, threshold in NEWS_SOURCE_THRESHOLDS.items()
+            if counts2.get(src, 0) < threshold
+        ]
+        if not still_missing:
+            log(f"  ✅ 補抓成功（"
+                + "、".join(f"{s}:{counts2.get(s,0)}筆" for s in NEWS_SOURCE_THRESHOLDS) + "）")
+            return True
+        else:
+            log(f"  ⚠️ 補抓後仍不足：{still_missing}（"
+                + "、".join(f"{s}:{counts2.get(s,0)}筆" for s in NEWS_SOURCE_THRESHOLDS) + "）")
+            return False
     except Exception as e:
         log(f"  ❌ 新聞補抓失敗：{e}")
         return False

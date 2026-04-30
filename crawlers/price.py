@@ -157,7 +157,6 @@ class TWStockCrawler(BaseCrawler):
                     if not df_twse.empty: df_twse['market'] = 'TWSE'; frames.append(df_twse)
                     if not df_tpex.empty: df_tpex['market'] = 'TPEx'; frames.append(df_tpex)
                     
-                    log_status = 'EMPTY'
                     if not df_twse.empty and not df_tpex.empty:
                         # 兩者都有，才進行合併與正常寫入
                         final_df = pd.concat(frames, ignore_index=True)
@@ -166,16 +165,21 @@ class TWStockCrawler(BaseCrawler):
                         final_df.drop_duplicates(subset=['date', 'stock_id'], keep='last', inplace=True)
                         count = db.upsert_from_df(table="tw_daily_prices", df=final_df, on=["date", "stock_id"])
                         print(f"   ✅ 寫入: {count} 筆")
-                        log_status = 'DONE'
+                        log_df = pd.DataFrame([{"date": date_iso, "status": "DONE"}])
+                        db.upsert_from_df("tw_crawler_logs", log_df, on=["date"])
+                        existing_dates.add(date_iso)
                     elif not df_twse.empty and df_tpex.empty:
-                        print(f"   ⚠️ 警告：缺少上櫃資料 (API可能尚未更新)，視為未完成，放棄寫入等待重試。")
+                        # 資料不完整（可能斷網或 API 未更新），不寫 log，下次重試
+                        print(f"   ⚠️ 警告：缺少上櫃資料 (API可能尚未更新)，視為未完成，下次重試。")
                     elif df_twse.empty and not df_tpex.empty:
-                        print(f"   ⚠️ 異常：僅有上櫃資料，視為未完成，放棄寫入等待重試。")
-                    else: print(f"   💤 休市")
-
-                    log_df = pd.DataFrame([{ "date": date_iso, "status": log_status }])
-                    db.upsert_from_df("tw_crawler_logs", log_df, on=["date"])
-                    existing_dates.add(date_iso)
+                        # 資料不完整，不寫 log，下次重試
+                        print(f"   ⚠️ 異常：僅有上櫃資料，視為未完成，下次重試。")
+                    else:
+                        # 兩邊都空 = 真正休市，記錄避免重複爬
+                        print(f"   💤 休市")
+                        log_df = pd.DataFrame([{"date": date_iso, "status": "EMPTY"}])
+                        db.upsert_from_df("tw_crawler_logs", log_df, on=["date"])
+                        existing_dates.add(date_iso)
                     time.sleep(random.uniform(5, 8))
                 except Exception as e:
                     print(f"   ❌ 錯誤: {e}"); time.sleep(5)
