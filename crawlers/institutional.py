@@ -95,14 +95,12 @@ class TWInstitutionalCrawler(BaseCrawler):
                     df['date'] = date_iso
                     count = db.upsert_from_df("tw_institutional_trades", df, on=["date", "stock_id"])
                     print(f"      ✅ 寫入: {count} 筆")
-                    log_status = 'DONE'
+                    log_df = pd.DataFrame([{"date": date_iso, "status": "DONE"}])
+                    db.upsert_from_df("tw_institutional_logs", log_df, on=["date"])
+                    existing_dates.add(date_iso)
                 else:
-                    print(f"      💤 無資料 (可能休市或尚未更新)")
-                    log_status = 'EMPTY'
-
-                log_df = pd.DataFrame([{ "date": date_iso, "status": log_status }])
-                db.upsert_from_df("tw_institutional_logs", log_df, on=["date"])
-                existing_dates.add(date_iso)
+                    # 資料不足（可能斷網或 API 未更新），不寫 log，下次重試
+                    print(f"      ⚠️ 無資料 (可能斷網或 API 尚未更新)，下次重試")
                 
                 target_date -= timedelta(days=1)
                 time.sleep(random.uniform(3, 5)) # 避免被證交所封 IP
