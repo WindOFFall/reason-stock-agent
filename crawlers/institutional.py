@@ -88,19 +88,24 @@ class TWInstitutionalCrawler(BaseCrawler):
                     target_date -= timedelta(days=1)
                     continue
 
+                MIN_INST_COUNT = 800  # 正常交易日上市股票約 900~1200 筆
+
                 print(f"   📊 [法人籌碼] 抓取上市資料: {date_iso} ...")
                 df = self._get_twse_institutional(date_compact)
-                
-                if not df.empty:
+
+                if len(df) >= MIN_INST_COUNT:
                     df['date'] = date_iso
                     count = db.upsert_from_df("tw_institutional_trades", df, on=["date", "stock_id"])
                     print(f"      ✅ 寫入: {count} 筆")
                     log_df = pd.DataFrame([{"date": date_iso, "status": "DONE"}])
                     db.upsert_from_df("tw_institutional_logs", log_df, on=["date"])
                     existing_dates.add(date_iso)
+                elif not df.empty:
+                    # 有資料但筆數不足（可能爬到一半斷線），不寫 log，下次重試
+                    print(f"      ⚠️ 資料不完整：僅 {len(df)} 筆（門檻 {MIN_INST_COUNT}），下次重試")
                 else:
-                    # 資料不足（可能斷網或 API 未更新），不寫 log，下次重試
-                    print(f"      ⚠️ 無資料 (可能斷網或 API 尚未更新)，下次重試")
+                    # 完全無資料（斷網或 API 未更新），不寫 log，下次重試
+                    print(f"      ⚠️ 無資料（可能斷網或 API 尚未更新），下次重試")
                 
                 target_date -= timedelta(days=1)
                 time.sleep(random.uniform(3, 5)) # 避免被證交所封 IP
