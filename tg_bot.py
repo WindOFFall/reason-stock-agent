@@ -120,7 +120,9 @@ async def cmd_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global _crawl_running
         _crawl_running = True
         try:
-            run_pipeline(days_back=3)
+            import importlib, data_pipeline
+            importlib.reload(data_pipeline)
+            data_pipeline.run_pipeline(days_back=3)
             s2 = _check_data_status()
             all_ok = s2["price"] and s2["inst"] and s2["news"]
             if all_ok:
@@ -157,7 +159,9 @@ async def cmd_crawl_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global _crawl_running
         _crawl_running = True
         try:
-            run_all(days_back=3)
+            import importlib, data_pipeline
+            importlib.reload(data_pipeline)
+            data_pipeline.run_all(days_back=3)
             s2 = _check_data_status()
             all_ok = s2["price"] and s2["inst"] and s2["news"]
             if all_ok:
