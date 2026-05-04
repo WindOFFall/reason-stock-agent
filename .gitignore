@@ -30,6 +30,8 @@ logs/
 *.csv
 *.xlsx
 *.json
+!web/frontend/package.json
+!web/frontend/package-lock.json
 *.sql
 *.sqlite3
 
