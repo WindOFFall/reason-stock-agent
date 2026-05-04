@@ -104,8 +104,9 @@ def ensure_tw_price(target_date: datetime) -> bool:
     log(f"  🔄 台股股價 {target_date.strftime('%Y-%m-%d')} 缺漏，開始補抓...")
     try:
         from crawlers.price import TWStockCrawler
+        days_needed = (datetime.now() - target_date).days + 3
         crawler = TWStockCrawler()
-        crawler.run(mode="backfill", days_back=5)
+        crawler.run(mode="backfill", days_back=days_needed)
         ok = check_table_has_data_v2("tw_daily_prices", "date", target_date)
         log(f"  {'✅ 補抓成功' if ok else '⚠️ 補抓後仍無資料（可能為假日）'}")
         return ok
@@ -123,8 +124,9 @@ def ensure_institutional(target_date: datetime) -> bool:
     log(f"  🔄 三大法人 {target_date.strftime('%Y-%m-%d')} 缺漏，開始補抓...")
     try:
         from crawlers.institutional import TWInstitutionalCrawler
+        days_needed = (datetime.now() - target_date).days + 3
         crawler = TWInstitutionalCrawler()
-        crawler.run(mode="backfill", days_back=5)
+        crawler.run(mode="backfill", days_back=days_needed)
         ok = check_table_has_data_v2("tw_institutional_trades", "date", target_date)
         log(f"  {'✅ 補抓成功' if ok else '⚠️ 補抓後仍無資料（可能為假日）'}")
         return ok
