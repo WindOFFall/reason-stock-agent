@@ -23,7 +23,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from data_pipeline import (
-    run_all, run_pipeline, check_table_has_data_v2, is_tw_trading_day
+    run_all, run_pipeline, check_table_has_data_v2, is_tw_trading_day,
+    _check_news_by_source, NEWS_SOURCE_THRESHOLDS
 )
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -51,7 +52,10 @@ def _check_data_status() -> dict:
         "date":  d.strftime("%Y-%m-%d"),
         "price": check_table_has_data_v2("tw_daily_prices",         "date",         d, min_count=1500),
         "inst":  check_table_has_data_v2("tw_institutional_trades",  "date",         d, min_count=800),
-        "news":  check_table_has_data_v2("market_intelligence",      "publish_date", d, min_count=5),
+        "news":  all(
+            _check_news_by_source(d).get(src, 0) >= threshold
+            for src, threshold in NEWS_SOURCE_THRESHOLDS.items()
+        ),
     }
 
 
